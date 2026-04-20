@@ -28,3 +28,5 @@ Telegram-бот с бесплатным тарифом (5 идей/день) и 
 | Приветствие | Выбор категории | Пример идеи | Лимит идей |
 |-------------|----------------|-------------|-------------|
 | ![start](screenshots/start.png) | ![category](screenshots/category.png) | ![gift](screenshots/gift.png) | ![limit](screenshots/limit.png) |
+
+📌 **Примеры моих промптов** смотри в файле [prompts.md](prompts.md).
