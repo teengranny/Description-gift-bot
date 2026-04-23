@@ -1,19 +1,19 @@
 # ============================================================
 # ГЕНЕРАТОР ИДЕЙ ПОДАРКОВ — TELEGRAM BOT
 # Запуск: python app.py
-# Требуется: pip install python-telegram-bot==21.10 flask
-# Переменные окружения: TELEGRAM_BOT_TOKEN, PROVIDER_TOKEN
+# Требуется: pip install python-telegram-bot==21.10 flask supabase
+# Переменные окружения: TELEGRAM_BOT_TOKEN, PROVIDER_TOKEN, SUPABASE_URL, SUPABASE_KEY
 # ============================================================
 
+import uuid
 import logging
 import os
 import random
 import asyncio
 import threading
-import sqlite3
 from datetime import date
 
-from flask import Flask, request
+from flask import Flask
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, LabeledPrice
 from telegram.error import Conflict
 from telegram.ext import (
@@ -24,6 +24,8 @@ from telegram.ext import (
     MessageHandler,
     filters,
 )
+
+from supabase import create_client, Client
 
 # ============================================================
 # Flask-сервер для healthcheck (чтобы Render не убивал процесс)
@@ -45,64 +47,70 @@ def run_flask():
 threading.Thread(target=run_flask, daemon=True).start()
 
 # ============================================================
-# РАБОТА С БАЗОЙ ДАННЫХ SQLite (постоянное хранение премиума)
+# РАБОТА С БАЗОЙ ДАННЫХ Supabase
 # ============================================================
-DB_PATH = os.path.join(os.path.dirname(__file__), 'premium.db')
+supabase: Client = create_client(
+    os.environ.get("SUPABASE_URL"),
+    os.environ.get("SUPABASE_KEY")
+)
+
+PREMIUM_TABLE = "premium_users"
 
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('''CREATE TABLE IF NOT EXISTS premium_users
-                 (user_id INTEGER PRIMARY KEY)''')
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table(PREMIUM_TABLE).select("*").limit(1).execute()
+        print("Supabase connected")
+    except Exception as e:
+        print(f"Supabase error: {e}")
 
 def add_premium_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('INSERT OR IGNORE INTO premium_users (user_id) VALUES (?)', (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table(PREMIUM_TABLE).upsert({"user_id": user_id}).execute()
+        return True
+    except Exception as e:
+        print(f"Add error: {e}")
+        return False
 
 def remove_premium_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('DELETE FROM premium_users WHERE user_id = ?', (user_id,))
-    conn.commit()
-    conn.close()
+    try:
+        supabase.table(PREMIUM_TABLE).delete().eq("user_id", user_id).execute()
+        return True
+    except Exception as e:
+        print(f"Remove error: {e}")
+        return False
 
 def is_premium_user(user_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT 1 FROM premium_users WHERE user_id = ?', (user_id,))
-    result = c.fetchone()
-    conn.close()
-    return result is not None
+    try:
+        res = supabase.table(PREMIUM_TABLE).select("*").eq("user_id", user_id).execute()
+        return len(res.data) > 0
+    except Exception as e:
+        print(f"Check error: {e}")
+        return False
 
 def load_premium_users():
-    """Загрузить всех премиум-пользователей в словарь user_premium при старте"""
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute('SELECT user_id FROM premium_users')
-    rows = c.fetchall()
-    conn.close()
-    return {row[0]: True for row in rows}
+    premium_dict = {}
+    try:
+        res = supabase.table(PREMIUM_TABLE).select("*").execute()
+        for item in res.data:
+            premium_dict[item["user_id"]] = True
+    except Exception as e:
+        print(f"Load error: {e}")
+    return premium_dict
 
 # ============================================================
 # Хранилище для счётчиков, дат, премиум-статуса и фильтров
 # ============================================================
-user_requests = {}      # user_id -> количество идей за сегодня
-user_premium = {}       # user_id -> True/False (загружается из БД)
-user_last_date = {}     # user_id -> дата последнего сброса (YYYY-MM-DD)
-user_filters = {}       # user_id -> 'budget', 'middle', 'premium' или None
+user_requests = {}
+user_premium = {}
+user_last_date = {}
+user_filters = {}
 MAX_FREE = 5
 ADMIN_ID = 426916872    # Твой Telegram ID
 
 # ============================================================
-# БАЗА ПОДАРКОВ (сокращённая версия, ты можешь оставить свою полную)
+# БАЗА ПОДАРКОВ 
 # ============================================================
-GIFTS_DB = {
-    "man": [
+GIFTS_DB = {    "man": [
         {"title": "Умные часы с мониторингом здоровья", "emoji": "⌚", "priceType": "premium", "description": "Отслеживают пульс, сон и калории. Мотивируют больше двигаться.", "ozonLink": "https://takprdm.ru/0W944W82VmCiW7u0/?redirectTo=https%3A%2F%2Fwww.wildberries.ru%2Fcatalog%2F117603041%2Fdetail.aspx&erid=Y1jgkD6uB6jK1phqkTLTbNJPiD1a"},
         {"title": "Набор инструментов в кейсе", "emoji": "🔧", "priceType": "middle", "description": "Упорядочивают инструменты. Выручают при мелком ремонте.", "ozonLink": "https://takprdm.ru/0W944W82VmChQ0C0/?redirectTo=https%3A%2F%2Fwww.wildberries.ru%2Fcatalog%2F49844802%2Fdetail.aspx&erid=Y1jgkD6uB6jK1phqkTLTbNJPiD1a"},
         {"title": "Термокружка с подогревом от USB", "emoji": "🥤", "priceType": "budget", "description": "Заряжается от ноутбука. Сохраняет кофе горячим часами.", "ozonLink": "https://takprdm.ru/0W944W82iWCikk40/?redirectTo=https%3A%2F%2Fwww.wildberries.ru%2Fcatalog%2F808840619%2Fdetail.aspx&erid=Y1jgkD6uB6jK1phqkTLTbNJNKvJZ"},
@@ -199,6 +207,7 @@ GIFTS_DB = {
         {"title": "Подставка для ног эргономичная", "emoji": "🦶", "priceType": "budget", "description": "Снижает нагрузку на спину. Помогает сохранять правильную позу.", "ozonLink": "https://takprdm.ru/0W944W82VmChudu0/?redirectTo=https%3A%2F%2Fwww.wildberries.ru%2Fcatalog%2F61336211%2Fdetail.aspx&erid=Y1jgkD6uB6jK1phqkTLTbNJPiD1a"},
     ],
 }
+
 PRICE_LABELS = {"budget": "бюджетная", "middle": "средняя", "premium": "премиум"}
 CATEGORIES = {"man": "👔 Мужчине", "woman": "🌸 Женщине", "child": "🧸 Ребёнку", "colleague": "🤝 Коллеге"}
 
@@ -224,11 +233,11 @@ def get_main_keyboard(user_id: int) -> InlineKeyboardMarkup:
     buttons = [[InlineKeyboardButton(label, callback_data=f"cat:{key}")] for key, label in CATEGORIES.items()]
     if user_premium.get(user_id, False):
         current_filter = user_filters.get(user_id)
+        filter_label = "🎯 Фильтр по бюджету"
         if current_filter:
             filter_label = f"🎯 Фильтр: {PRICE_LABELS.get(current_filter, current_filter)}"
-        else:
-            filter_label = "🎯 Фильтр по бюджету"
         buttons.append([InlineKeyboardButton(filter_label, callback_data="filter")])
+    buttons.append([InlineKeyboardButton("📧 Поддержка", callback_data="support")])
     return InlineKeyboardMarkup(buttons)
 
 def build_gift_keyboard(category: str) -> InlineKeyboardMarkup:
@@ -256,7 +265,7 @@ async def start(update: Update, context):
 async def help_command(update: Update, context):
     user_id = update.effective_user.id
     await update.message.reply_text(
-        "🎁 *Подарочный гуру*\n\nКоманды:\n/start — главное меню\n/help — это сообщение\n/premium — купить безлимит\n\nБесплатно 5 идей в день. Премиум даёт безлимит и фильтр по бюджету.",
+        "🎁 *Подарочный гуру*\n\nКоманды:\n/start — главное меню\n/help — это сообщение\n/premium — купить безлимит\n/support — связаться с администратором\n\nБесплатно 5 идей в день. Премиум даёт безлимит и фильтр по бюджету.",
         parse_mode="Markdown",
         reply_markup=get_main_keyboard(user_id),
     )
@@ -278,7 +287,7 @@ async def premium(update: Update, context):
         provider_token=os.environ.get("PROVIDER_TOKEN"),
         currency=currency,
         prices=prices,
-        start_parameter="premium-payment",
+        start_parameter=f"premium_{user_id}_{uuid.uuid4().hex[:8]}",
         need_email=True,
         need_phone_number=True
     )
@@ -310,6 +319,15 @@ async def activate_premium(update: Update, context):
     except (IndexError, ValueError):
         await update.message.reply_text("❗ Используйте: /activate ID")
 
+async def support(update: Update, context):
+    await update.message.reply_text(
+        "📧 *Поддержка*\n\n"
+        "Если возникли вопросы или проблемы с оплатой – пишите на почту:\n\n"
+       "[maryaninovan@mail.ru](mailto:maryaninovan@mail.ru)",
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
 async def button_callback(update: Update, context):
     query = update.callback_query
     await query.answer()
@@ -334,7 +352,7 @@ async def button_callback(update: Update, context):
             [InlineKeyboardButton("↩️ Назад", callback_data="menu")]
         ])
         await query.edit_message_text(
-            "🎯 *Выберите бюджет*:",
+            "🎯 *Выбери бюджет*:",
             parse_mode="Markdown",
             reply_markup=keyboard
         )
@@ -360,6 +378,17 @@ async def button_callback(update: Update, context):
             text + "\n\nТеперь бот будет учитывать ваш бюджет.",
             parse_mode="Markdown",
             reply_markup=get_main_keyboard(user_id)
+        )
+        return
+
+    if data == "support":
+        await query.edit_message_text(
+            "📧 *Поддержка*\n\n"
+            "Если возникли вопросы или проблемы с оплатой – пиши на почту:\n\n"
+            "[maryaninovan@mail.ru](mailto:maryaninovan@mail.ru)",
+            parse_mode="Markdown",
+            reply_markup=get_main_keyboard(user_id),
+            disable_web_page_preview=True
         )
         return
 
@@ -404,7 +433,7 @@ async def error_handler(update: object, context):
 # ЗАПУСК
 # ============================================================
 logging.basicConfig(
-    format="%(asctime)s - %name)s - %(levelname)s - %(message)s",
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     level=logging.INFO,
 )
 logging.getLogger("httpx").setLevel(logging.WARNING)
@@ -428,6 +457,7 @@ def main() -> None:
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CommandHandler("premium", premium))
     application.add_handler(CommandHandler("activate", activate_premium))
+    application.add_handler(CommandHandler("support", support))
     application.add_handler(PreCheckoutQueryHandler(pre_checkout_handler))
     application.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
     application.add_handler(CallbackQueryHandler(button_callback))
